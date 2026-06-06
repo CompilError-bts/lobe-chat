@@ -3,11 +3,18 @@ import { lambdaClient } from '@/libs/trpc/client';
 import { type BatchTaskResult } from '@/types/service';
 import {
   type ChatTopic,
+  type ChatTopicMetadata,
   type CreateTopicParams,
   type QueryTopicParams,
   type RecentTopic,
   type TopicRankItem,
 } from '@/types/topic';
+
+type OnboardingSessionMetadataPatch = Partial<NonNullable<ChatTopicMetadata['onboardingSession']>>;
+
+type UpdateTopicMetadataInput = Omit<Partial<ChatTopicMetadata>, 'onboardingSession'> & {
+  onboardingSession?: OnboardingSessionMetadataPatch;
+};
 
 export class TopicService {
   createTopic = (params: CreateTopicParams): Promise<string> => {
@@ -37,10 +44,15 @@ export class TopicService {
     return lambdaClient.topic.getTopics.query({
       agentId: params.agentId,
       current: params.current,
+      excludeStatuses: params.excludeStatuses,
       excludeTriggers: params.excludeTriggers,
       groupId: params.groupId,
+      includeTriggers: params.includeTriggers,
       isInbox: params.isInbox,
       pageSize: params.pageSize,
+      sortBy: params.sortBy,
+      triggers: params.triggers,
+      withDetails: params.withDetails,
     }) as any;
   };
 
@@ -62,6 +74,10 @@ export class TopicService {
     return lambdaClient.topic.rankTopics.query(limit);
   };
 
+  getMaxTaskDuration = async (): Promise<number> => {
+    return lambdaClient.topic.getMaxTaskDuration.query();
+  };
+
   getRecentTopics = async (limit?: number): Promise<RecentTopic[]> => {
     return lambdaClient.topic.recentTopics.query({ limit });
   };
@@ -78,10 +94,7 @@ export class TopicService {
     return lambdaClient.topic.updateTopic.mutate({ id, value: data });
   };
 
-  updateTopicMetadata = (
-    id: string,
-    metadata: { model?: string; provider?: string; workingDirectory?: string },
-  ) => {
+  updateTopicMetadata = (id: string, metadata: UpdateTopicMetadataInput) => {
     return lambdaClient.topic.updateTopicMetadata.mutate({ id, metadata });
   };
 

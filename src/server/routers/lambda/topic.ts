@@ -8,6 +8,7 @@ import { eq, inArray } from 'drizzle-orm';
 import { after } from 'next/server';
 import { z } from 'zod';
 
+import { AgentOperationModel } from '@/database/models/agentOperation';
 import { MessageModel } from '@/database/models/message';
 import { TopicModel } from '@/database/models/topic';
 import { TopicShareModel } from '@/database/models/topicShare';
@@ -31,6 +32,7 @@ const topicProcedure = authedProcedure.use(serverDatabase).use(async (opts) => {
   return opts.next({
     ctx: {
       agentMigrationRepo: new AgentMigrationRepo(ctx.serverDB, ctx.userId),
+      agentOperationModel: new AgentOperationModel(ctx.serverDB, ctx.userId),
       topicImporterRepo: new TopicImporterRepo(ctx.serverDB, ctx.userId),
       topicModel: new TopicModel(ctx.serverDB, ctx.userId),
       topicShareModel: new TopicShareModel(ctx.serverDB, ctx.userId),
@@ -39,6 +41,14 @@ const topicProcedure = authedProcedure.use(serverDatabase).use(async (opts) => {
 });
 
 export const topicRouter = router({
+  getTopicDetail: topicProcedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const topic = await ctx.topicModel.findById(input.id);
+      if (!topic) return null;
+      return topic;
+    }),
+
   getTopicContext: topicProcedure
     .input(z.object({ topicId: z.string() }))
     .query(async ({ input, ctx }) => {
@@ -174,6 +184,7 @@ export const topicRouter = router({
           groupId: z.string().nullable().optional(),
           messages: z.array(z.string()).optional(),
           title: z.string(),
+          trigger: z.string().optional(),
         })
         .extend(basicContextSchema.shape),
     )
@@ -217,12 +228,6 @@ export const topicRouter = router({
     return ctx.topicModel.queryAll();
   }),
 
-  getCronTopicsGroupedByCronJob: topicProcedure
-    .input(z.object({ agentId: z.string() }))
-    .query(async ({ input, ctx }) => {
-      return ctx.topicModel.getCronTopicsGroupedByCronJob(input.agentId);
-    }),
-
   getShareInfo: topicProcedure
     .input(z.object({ topicId: z.string() }))
     .query(async ({ input, ctx }) => {
@@ -234,19 +239,49 @@ export const topicRouter = router({
       z.object({
         agentId: z.string().nullable().optional(),
         current: z.number().optional(),
+        excludeStatuses: z.array(z.string()).optional(),
         excludeTriggers: z.array(z.string()).optional(),
         groupId: z.string().nullable().optional(),
+        includeTriggers: z.array(z.string()).optional(),
         isInbox: z.boolean().optional(),
-        pageSize: z.number().optional(),
+        pageSize: z.number().max(100).optional(),
         sessionId: z.string().nullable().optional(),
+        /**
+         * Server-side ordering. Defaults to `updatedAt`; `status` orders by
+         * status priority for the sidebar "group by status" mode.
+         */
+        sortBy: z.enum(['updatedAt', 'status']).optional(),
+        triggers: z.array(z.string()).optional(),
+        /**
+         * When true, returns extra card-detail columns (firstUserMessage,
+         * messageCount, cost, tokenUsage, description, trigger). Default false
+         * so the sidebar list stays cheap — only the management page opts in.
+         */
+        withDetails: z.boolean().optional(),
       }),
     )
     .query(async ({ input, ctx }) => {
-      const { sessionId, isInbox, groupId, excludeTriggers, ...rest } = input;
+      const {
+        sessionId,
+        isInbox,
+        groupId,
+        excludeStatuses,
+        excludeTriggers,
+        includeTriggers,
+        triggers,
+        ...rest
+      } = input;
 
       // If groupId is provided, query by groupId directly
       if (groupId) {
-        const result = await ctx.topicModel.query({ excludeTriggers, groupId, ...rest });
+        const result = await ctx.topicModel.query({
+          excludeStatuses,
+          excludeTriggers,
+          groupId,
+          includeTriggers,
+          triggers,
+          ...rest,
+        });
         return { items: result.items, total: result.total };
       }
 
@@ -259,8 +294,11 @@ export const topicRouter = router({
       const result = await ctx.topicModel.query({
         ...rest,
         agentId: effectiveAgentId,
+        excludeStatuses,
         excludeTriggers,
+        includeTriggers,
         isInbox,
+        triggers,
       });
 
       // Runtime migration: backfill agentId for ALL legacy topics and messages under this agent
@@ -317,12 +355,16 @@ export const topicRouter = router({
       return result;
     }),
 
-  rankTopics: topicProcedure.input(z.number().optional()).query(async ({ ctx, input }) => {
+  getMaxTaskDuration: topicProcedure.query(async ({ ctx }) => {
+    return ctx.agentOperationModel.getMaxDurationSeconds();
+  }),
+
+  rankTopics: topicProcedure.input(z.number().max(50).optional()).query(async ({ ctx, input }) => {
     return ctx.topicModel.rank(input);
   }),
 
   recentTopics: topicProcedure
-    .input(z.object({ limit: z.number().optional() }).optional())
+    .input(z.object({ limit: z.number().max(50).optional() }).optional())
     .query(async ({ ctx, input }): Promise<RecentTopic[]> => {
       const recentTopics = await ctx.topicModel.queryRecent(input?.limit ?? 12);
 
@@ -524,6 +566,7 @@ export const topicRouter = router({
         id: z.string(),
         value: z.object({
           agentId: z.string().optional(),
+          completedAt: z.date().nullable().optional(),
           favorite: z.boolean().optional(),
           historySummary: z.string().optional(),
           messages: z.array(z.string()).optional(),
@@ -534,6 +577,18 @@ export const topicRouter = router({
             })
             .optional(),
           sessionId: z.string().optional(),
+          status: z
+            .enum([
+              'active',
+              'running',
+              'paused',
+              'waitingForHuman',
+              'failed',
+              'completed',
+              'archived',
+            ])
+            .nullable()
+            .optional(),
           title: z.string().optional(),
         }),
       }),
@@ -556,8 +611,59 @@ export const topicRouter = router({
       z.object({
         id: z.string(),
         metadata: z.object({
+          boundDeviceId: z.string().optional(),
+          heteroSessionId: z.string().optional(),
           model: z.string().optional(),
+          onboardingFeedback: z
+            .object({
+              comment: z.string().max(500).optional(),
+              rating: z.enum(['good', 'bad']),
+              submittedAt: z.string(),
+            })
+            .optional(),
+          onboardingSession: z
+            .object({
+              agentIdentityCompletedAt: z.string().optional(),
+              agentMarketplacePick: z
+                .object({
+                  categoryHints: z.array(z.string()),
+                  installedAgentIds: z.array(z.string()).optional(),
+                  requestId: z.string(),
+                  resolvedAt: z.string(),
+                  selectedTemplateIds: z.array(z.string()).optional(),
+                  skipReason: z.string().optional(),
+                  skippedAgentIds: z.array(z.string()).optional(),
+                  status: z.enum(['cancelled', 'skipped', 'submitted']),
+                })
+                .optional(),
+              discoveryCompletedAt: z.string().optional(),
+              finalAgentNames: z.array(z.string()).optional(),
+              finishedAt: z.string().optional(),
+              lastActiveAt: z.string().optional(),
+              phase: z.enum(['agent_identity', 'user_identity', 'discovery', 'summary']).optional(),
+              startedAt: z.string().optional(),
+              userIdentityCompletedAt: z.string().optional(),
+              version: z.number().optional(),
+            })
+            .optional(),
           provider: z.string().optional(),
+          runningOperation: z
+            .object({
+              assistantMessageId: z.string(),
+              completionWebhook: z
+                .object({
+                  body: z.record(z.unknown()).optional(),
+                  delivery: z.enum(['fetch', 'qstash']).optional(),
+                  url: z.string(),
+                })
+                .optional(),
+              operationId: z.string(),
+              scope: z.string().optional(),
+              threadId: z.string().nullable().optional(),
+            })
+            .nullable()
+            .optional(),
+          repos: z.array(z.string()).optional(),
           workingDirectory: z.string().optional(),
         }),
       }),

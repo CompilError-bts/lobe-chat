@@ -10,8 +10,10 @@ import {
   agentEvalRunTopics,
   agentEvalTestCases,
 } from './agentEvals';
+import { agentShares } from './agentShare';
 import { asyncTasks } from './asyncTask';
 import { chatGroups, chatGroupsAgents } from './chatGroup';
+import { documentHistories } from './documentHistory';
 import { documents, files, knowledgeBases } from './file';
 import { generationBatches, generations, generationTopics } from './generation';
 import { messageGroups, messages, messagesFiles, messageTranslates } from './message';
@@ -129,11 +131,12 @@ export const messagesRelations = relations(messages, ({ many, one }) => ({
   }),
 }));
 
-export const agentsRelations = relations(agents, ({ many }) => ({
+export const agentsRelations = relations(agents, ({ many, one }) => ({
   agentsToSessions: many(agentsToSessions),
-  knowledgeBases: many(agentsKnowledgeBases),
-  files: many(agentsFiles),
   chatGroups: many(chatGroupsAgents),
+  files: many(agentsFiles),
+  knowledgeBases: many(agentsKnowledgeBases),
+  share: one(agentShares, { fields: [agents.id], references: [agentShares.agentId] }),
 }));
 
 export const agentsToSessionsRelations = relations(agentsToSessions, ({ one }) => ({
@@ -246,6 +249,18 @@ export const documentsRelations = relations(documents, ({ one, many }) => ({
   }),
   topics: many(topicDocuments),
   chunks: many(documentChunks),
+  histories: many(documentHistories),
+}));
+
+export const documentHistoriesRelations = relations(documentHistories, ({ one }) => ({
+  document: one(documents, {
+    fields: [documentHistories.documentId],
+    references: [documents.id],
+  }),
+  user: one(users, {
+    fields: [documentHistories.userId],
+    references: [users.id],
+  }),
 }));
 
 export const topicDocumentsRelations = relations(topicDocuments, ({ one }) => ({

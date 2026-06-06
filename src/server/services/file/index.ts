@@ -8,9 +8,18 @@ import { FileModel } from '@/database/models/file';
 import { type FileItem } from '@/database/schemas';
 import { appEnv } from '@/envs/app';
 import { TempFileManager } from '@/server/utils/tempFileManager';
+import { isDev } from '@/utils/env';
 
 import { createFileServiceModule } from './impls';
 import { type FileServiceImpl } from './impls/type';
+
+export const getFileProxyUrl = (fileId: string): string => `${appEnv.APP_URL}/f/${fileId}`;
+
+export interface FileAccessUrlItem {
+  fileId?: string | null;
+  id?: string | null;
+  url?: string | null;
+}
 
 /**
  * File service class
@@ -81,6 +90,16 @@ export class FileService {
   }
 
   /**
+   * Create cached pre-signed preview URL
+   */
+  public async createCachedPreSignedUrlForPreview(
+    url?: string | null,
+    expiresIn?: number,
+  ): Promise<string> {
+    return this.impl.createCachedPreSignedUrlForPreview(url, expiresIn);
+  }
+
+  /**
    * Upload content
    */
   public async uploadContent(path: string, content: string) {
@@ -92,6 +111,21 @@ export class FileService {
    */
   public async getFullFileUrl(url?: string | null, expiresIn?: number): Promise<string> {
     return this.impl.getFullFileUrl(url, expiresIn);
+  }
+
+  /**
+   * Resolve a file URL for consumers that need to read the file.
+   * Production uses the stable file proxy URL; local development falls back to
+   * the storage URL so remote model providers can download local test files.
+   */
+  public async getFileAccessUrl(file: FileAccessUrlItem): Promise<string> {
+    const fileId = file.fileId || file.id;
+
+    if (!isDev && fileId) {
+      return getFileProxyUrl(fileId);
+    }
+
+    return this.getFullFileUrl(file.url);
   }
 
   /**
@@ -119,6 +153,16 @@ export class FileService {
     return this.impl.uploadBuffer(key, buffer, contentType);
   }
 
+  private async isStoredFileAvailable(url: string): Promise<boolean> {
+    try {
+      await this.getFileMetadata(url);
+      return true;
+    } catch (error) {
+      console.error('Failed to verify existing file hash storage object:', error);
+      return false;
+    }
+  }
+
   /**
    * Create file record (common method)
    * Automatically handles globalFiles deduplication logic
@@ -131,12 +175,28 @@ export class FileService {
     fileHash: string;
     fileType: string;
     id?: string;
+    metadata?: Record<string, unknown>;
     name: string;
     size: number;
     url: string;
   }): Promise<{ fileId: string; url: string }> {
     // Check if hash already exists in globalFiles
-    const { isExist } = await this.fileModel.checkHash(params.fileHash);
+    const existingFile = await this.fileModel.checkHash(params.fileHash);
+    const { isExist } = existingFile;
+
+    let shouldRefreshGlobalFile = false;
+    if (isExist && existingFile.url && existingFile.url !== params.url) {
+      shouldRefreshGlobalFile = !(await this.isStoredFileAvailable(existingFile.url));
+    }
+
+    if (shouldRefreshGlobalFile) {
+      // Keep global hash dedup usable when the same file is uploaded again to a
+      // fresh object key after the previous storage object has been removed.
+      await this.fileModel.updateGlobalFile(params.fileHash, {
+        metadata: params.metadata,
+        url: params.url,
+      });
+    }
 
     // Create database record
     // If hash doesn't exist, also create globalFiles record
@@ -145,6 +205,7 @@ export class FileService {
         fileHash: params.fileHash,
         fileType: params.fileType,
         id: params.id, // Use custom ID if provided
+        metadata: params.metadata,
         name: params.name,
         size: params.size,
         url: params.url,
@@ -152,10 +213,9 @@ export class FileService {
       !isExist, // insertToGlobalFiles
     );
 
-    // Return unified proxy URL: ${APP_URL}/f/:id
     return {
       fileId: id,
-      url: `${appEnv.APP_URL}/f/${id}`,
+      url: await this.getFileAccessUrl({ id, url: params.url }),
     };
   }
 
@@ -285,6 +345,44 @@ export class FileService {
   }
 
   /**
+   * Upload a buffer to S3 and create database record.
+   * Used by the bot platform to upload media directly without data URL roundtrip.
+   */
+  public async uploadFromBuffer(
+    buffer: Buffer,
+    mimeType: string,
+    pathname: string,
+  ): Promise<{ fileId: string; key: string; url: string }> {
+    // Use uploadBuffer with explicit contentType so S3 Content-Type matches
+    // the actual bytes (e.g. PNG buffer won't get image/jpeg from .jpg pathname)
+    const { key } = await this.uploadBuffer(pathname, buffer, mimeType);
+
+    const name = pathname.split('/').pop() || 'unknown';
+    const size = buffer.length;
+    const hash = sha256(buffer);
+    const fileId = uuid();
+
+    // Derive dirname from pathname for metadata compatibility with UI upload path.
+    // UI stores { date, dirname, filename, path } in globalFiles.metadata;
+    // checkFileHash returns this metadata for dedup — bot records must match.
+    const parts = pathname.split('/');
+    const filename = parts.pop() || name;
+    const dirname = parts.join('/');
+
+    const { fileId: createdId, url } = await this.createFileRecord({
+      fileHash: hash,
+      fileType: mimeType,
+      id: fileId,
+      metadata: { date: new Date().toISOString().slice(0, 10), dirname, filename, path: pathname },
+      name,
+      size,
+      url: key,
+    });
+
+    return { fileId: createdId, key, url };
+  }
+
+  /**
    * Download file from external URL, upload to S3, and create database record
    * @param externalUrl - External file URL to download (e.g., Discord CDN)
    * @param pathname - File storage path in S3 (must include file extension)
@@ -313,10 +411,15 @@ export class FileService {
 
     // Calculate file metadata
     const size = buffer.length;
-    const fileType =
-      response.headers.get('content-type') ||
-      inferContentTypeFromImageUrl(pathname) ||
-      'application/octet-stream';
+    let fileType = response.headers.get('content-type') || '';
+    if (!fileType || fileType === 'application/octet-stream') {
+      try {
+        fileType = inferContentTypeFromImageUrl(pathname);
+      } catch {
+        // inferContentTypeFromImageUrl throws for non-image extensions — fall back
+        fileType = fileType || 'application/octet-stream';
+      }
+    }
     const hash = sha256(buffer);
 
     // Generate UUID for cleaner URLs

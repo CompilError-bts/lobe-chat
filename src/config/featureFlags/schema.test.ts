@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { evaluateFeatureFlag, FeatureFlagsSchema, mapFeatureFlagsEnvToState } from './schema';
+import {
+  DEFAULT_FEATURE_FLAGS,
+  evaluateFeatureFlag,
+  FeatureFlagsSchema,
+  mapFeatureFlagsEnvToState,
+} from './schema';
 
 describe('FeatureFlagsSchema', () => {
   it('should validate correct feature flags with boolean values', () => {
@@ -96,6 +101,18 @@ describe('evaluateFeatureFlag', () => {
 });
 
 describe('mapFeatureFlagsEnvToState', () => {
+  it('should enable auth captcha by default', () => {
+    const mappedState = mapFeatureFlagsEnvToState(DEFAULT_FEATURE_FLAGS);
+
+    expect(mappedState.enableAuthCaptcha).toBe(true);
+  });
+
+  it('should enable storage overage by default', () => {
+    const mappedState = mapFeatureFlagsEnvToState(DEFAULT_FEATURE_FLAGS);
+
+    expect(mappedState.enableStorageOverage).toBe(true);
+  });
+
   it('should correctly map boolean feature flags to state', () => {
     const config = {
       provider_settings: true,
@@ -107,11 +124,15 @@ describe('mapFeatureFlagsEnvToState', () => {
       welcome_suggest: true,
       knowledge_base: false,
       rag_eval: true,
+      agent_self_iteration: true,
+      agent_onboarding: true,
+      auth_captcha: true,
       market: true,
       speech_to_text: true,
       changelog: false,
       api_key_manage: false,
       cloud_promotion: true,
+      storage_overage: false,
       commercial_hide_github: false,
       commercial_hide_docs: true,
     };
@@ -130,6 +151,10 @@ describe('mapFeatureFlagsEnvToState', () => {
       showWelcomeSuggest: true,
       enableKnowledgeBase: false,
       enableRAGEval: true,
+      enableAgentSelfIteration: true,
+      enableAgentOnboarding: true,
+      enableAuthCaptcha: true,
+      enableStorageOverage: false,
       showMarket: true,
       enableSTT: true,
       showCloudPromotion: true,
@@ -142,6 +167,10 @@ describe('mapFeatureFlagsEnvToState', () => {
     const userId = 'user-123';
     const config = {
       edit_agent: ['user-123', 'user-456'],
+      agent_self_iteration: ['user-123'],
+      agent_onboarding: ['user-123'],
+      auth_captcha: ['user-123'],
+      storage_overage: ['user-123'],
       create_session: ['user-789'],
       dalle: true,
       knowledge_base: ['user-123'],
@@ -151,6 +180,10 @@ describe('mapFeatureFlagsEnvToState', () => {
 
     expect(mappedState.isAgentEditable).toBe(true); // user-123 is in allowlist
 
+    expect(mappedState.enableAgentSelfIteration).toBe(true); // user-123 is in allowlist
+    expect(mappedState.enableAgentOnboarding).toBe(true); // user-123 is in allowlist
+    expect(mappedState.enableAuthCaptcha).toBe(true); // user-123 is in allowlist
+    expect(mappedState.enableStorageOverage).toBe(true); // user-123 is in allowlist
     expect(mappedState.enableKnowledgeBase).toBe(true); // user-123 is in allowlist
   });
 
@@ -169,12 +202,16 @@ describe('mapFeatureFlagsEnvToState', () => {
 
   it('should return false for array flags when no user ID provided', () => {
     const config = {
+      agent_self_iteration: ['user-1'],
+      agent_onboarding: ['user-1'],
       edit_agent: ['user-123', 'user-456'],
       create_session: true,
     };
 
     const mappedState = mapFeatureFlagsEnvToState(config);
 
+    expect(mappedState.enableAgentSelfIteration).toBe(false);
+    expect(mappedState.enableAgentOnboarding).toBe(false);
     expect(mappedState.isAgentEditable).toBe(false);
   });
 
@@ -182,6 +219,8 @@ describe('mapFeatureFlagsEnvToState', () => {
     const userId = 'user-123';
     const config = {
       edit_agent: ['user-123'],
+      agent_self_iteration: ['user-123'],
+      agent_onboarding: ['user-123'],
       create_session: true,
       dalle: false,
       ai_image: ['user-456'],
@@ -193,6 +232,8 @@ describe('mapFeatureFlagsEnvToState', () => {
 
     expect(mappedState.isAgentEditable).toBe(true);
 
+    expect(mappedState.enableAgentSelfIteration).toBe(true);
+    expect(mappedState.enableAgentOnboarding).toBe(true);
     expect(mappedState.showAiImage).toBe(false);
     expect(mappedState.enableKnowledgeBase).toBe(true);
     expect(mappedState.enableRAGEval).toBe(true);
