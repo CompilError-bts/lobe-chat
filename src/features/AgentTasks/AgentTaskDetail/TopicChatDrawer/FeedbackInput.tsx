@@ -1,103 +1,157 @@
-import { SendButton, useEditor } from '@lobehub/editor/react';
-import { Avatar, Flexbox } from '@lobehub/ui';
+import { ChatInput, ChatInputActionBar, SendButton, useEditor } from '@lobehub/editor/react';
+import { Flexbox } from '@lobehub/ui';
+import { Button } from '@lobehub/ui/base-ui';
 import { $getRoot } from 'lexical';
-import { memo, useCallback, useState } from 'react';
+import { ChevronDownIcon, MessageCirclePlus } from 'lucide-react';
+import { memo, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { shallow } from 'zustand/shallow';
 
 import { AttachmentUploadButton } from '@/features/AttachmentInput';
+import { useConversationStore } from '@/features/Conversation';
+import OpStatusTray from '@/features/Conversation/ChatInput/OpStatusTray';
+import { useConversationResourceAccess } from '@/features/Conversation/hooks/useConversationResourceAccess';
 import { EditorCanvas } from '@/features/EditorCanvas';
 import {
   getAttachmentFileIdsFromEditor,
   insertFilesIntoEditor,
 } from '@/features/EditorCanvas/editorAttachments';
 import { useEnterToSend } from '@/hooks/useEnterToSend';
-import { useUserAvatar } from '@/hooks/useUserAvatar';
-import { useTaskStore } from '@/store/task';
-
-import { styles } from '../../shared/style';
 
 interface FeedbackInputProps {
-  taskId: string;
-  topicId: string;
+  /** Acceptance's in-flow topic rail starts with the composer visible. The
+      floating Topic drawer keeps its compact, opt-in default. */
+  defaultExpanded?: boolean;
+  /** Hide the collapse affordance when the hosting surface intentionally pins
+      the composer open, as Acceptance's in-flow right rail does. */
+  disableCollapse?: boolean;
 }
 
-const FeedbackInput = memo<FeedbackInputProps>(({ taskId, topicId }) => {
-  const { t } = useTranslation('chat');
-  const editor = useEditor();
-  const userAvatar = useUserAvatar();
-  const { addComment, runTask, closeTopicDrawer } = useTaskStore(
-    (s) => ({
-      addComment: s.addComment,
-      closeTopicDrawer: s.closeTopicDrawer,
-      runTask: s.runTask,
-    }),
-    shallow,
-  );
-  const [submitting, setSubmitting] = useState(false);
-  const [hasContent, setHasContent] = useState(false);
-  const [hasAttachments, setHasAttachments] = useState(false);
-  const shouldSendOnEnter = useEnterToSend();
+const FeedbackInput = memo<FeedbackInputProps>(
+  ({ defaultExpanded = false, disableCollapse = false }) => {
+    const { t } = useTranslation('chat');
+    const editor = useEditor();
+    const sendMessage = useConversationStore((s) => s.sendMessage);
+    const [submitting, setSubmitting] = useState(false);
+    const [hasContent, setHasContent] = useState(false);
+    const [hasAttachments, setHasAttachments] = useState(false);
+    const [expanded, setExpanded] = useState(defaultExpanded);
+    const shouldSendOnEnter = useEnterToSend();
+    // Task follow-ups send into the shared agent's topic — view-only members
+    // can watch the run but get no reply composer.
+    const { canUseResource } = useConversationResourceAccess();
 
-  const canSubmit = hasContent || hasAttachments;
+    const canSubmit = hasContent || hasAttachments;
 
-  const handleContentChange = useCallback(() => {
-    const lexicalEditor = editor?.getLexicalEditor?.();
-    if (!lexicalEditor) return;
-    lexicalEditor.getEditorState().read(() => {
-      const text = $getRoot().getTextContent().trim();
-      setHasContent(text.length > 0);
-    });
-    setHasAttachments(getAttachmentFileIdsFromEditor(editor).length > 0);
-  }, [editor]);
+    useEffect(() => {
+      if (expanded) editor?.focus?.();
+    }, [expanded, editor]);
 
-  const handleAttach = useCallback(
-    (files: File[]) => {
-      insertFilesIntoEditor(editor, files);
-    },
-    [editor],
-  );
-
-  const handleSubmit = useCallback(async () => {
-    if (submitting) return;
-    const json = editor?.getDocument?.('json') as unknown;
-    const markdown = String(editor?.getDocument?.('markdown') ?? '').trim();
-    const hasFiles = getAttachmentFileIdsFromEditor(editor).length > 0;
-    if (!markdown && !hasFiles) return;
-
-    setSubmitting(true);
-    try {
-      await addComment(taskId, markdown, {
-        editorData: json,
-        topicId,
+    const handleContentChange = useCallback(() => {
+      const lexicalEditor = editor?.getLexicalEditor?.();
+      if (!lexicalEditor) return;
+      lexicalEditor.getEditorState().read(() => {
+        const text = $getRoot().getTextContent().trim();
+        setHasContent(text.length > 0);
       });
-      // Start a NEW topic run that picks up the comment we just attached to the
-      // current topic. Do NOT pass continueTopicId — that would flip the
-      // already-completed topic back to running and overwrite its operation id.
-      try {
-        await runTask(taskId);
-      } catch (error) {
-        console.warn('[FeedbackInput] runTask failed', error);
-      }
+      setHasAttachments(getAttachmentFileIdsFromEditor(editor).length > 0);
+    }, [editor]);
+
+    const handleAttach = useCallback(
+      (files: File[]) => {
+        insertFilesIntoEditor(editor, files);
+      },
+      [editor],
+    );
+
+    const handleSubmit = useCallback(async () => {
+      if (submitting) return;
+      const editorData = editor?.getDocument?.('json') as Record<string, any> | undefined;
+      const markdown = String(editor?.getDocument?.('markdown') ?? '').trim();
+      const hasFiles = getAttachmentFileIdsFromEditor(editor).length > 0;
+      if (!markdown && !hasFiles) return;
+
+      // Clear the editor synchronously BEFORE await so the input feels
+      // responsive — sendMessage's optimistic-update pipeline keeps a copy
+      // of the captured markdown / editorData for rendering. Keep the
+      // ChatInput expanded after send: once the user has opened the reply
+      // composer, treat it as the new resting state for this drawer session.
       editor?.cleanDocument?.();
       setHasContent(false);
       setHasAttachments(false);
-      closeTopicDrawer();
-    } finally {
-      setSubmitting(false);
-    }
-  }, [taskId, topicId, editor, addComment, runTask, closeTopicDrawer, submitting]);
 
-  return (
-    <Flexbox className={styles.commentInputCard} gap={6}>
-      <Flexbox horizontal align={'flex-start'} gap={8}>
-        <Avatar avatar={userAvatar} size={24} style={{ flexShrink: 0, marginBlockStart: 4 }} />
-        <div style={{ flex: 1, minWidth: 0 }}>
+      setSubmitting(true);
+      try {
+        // sendMessage is bound to this drawer's ConversationProvider context
+        // (agentId + topicId + isolatedTopic), so the message continues this
+        // topic's conversation. Files attached inline in the editor travel as
+        // part of editorData / markdown — no separate files array needed.
+        // Force the gateway runtime so the follow-up runs on the same
+        // server-side path as the original `runTask` that spawned this topic,
+        // regardless of the user's global local/cloud preference.
+        await sendMessage({ editorData, forceRuntime: 'gateway', message: markdown });
+      } finally {
+        setSubmitting(false);
+      }
+    }, [editor, sendMessage, submitting]);
+
+    if (!canUseResource) return <OpStatusTray seamless />;
+
+    // Surface the live running-op status flush above the reply affordance (seamless
+    // inline row that renders nothing when idle), so the user can watch the agent
+    // work without expanding the composer.
+    if (!expanded) {
+      return (
+        <Flexbox gap={8}>
+          <OpStatusTray seamless />
+          <Button block icon={MessageCirclePlus} type={'fill'} onClick={() => setExpanded(true)}>
+            {t('taskDetail.sendFollowUp')}
+          </Button>
+        </Flexbox>
+      );
+    }
+
+    return (
+      <Flexbox gap={8}>
+        <OpStatusTray seamless />
+        <ChatInput
+          maxHeight={240}
+          minHeight={64}
+          footer={
+            <ChatInputActionBar
+              style={{ paddingInline: 8 }}
+              left={
+                <Flexbox horizontal align={'center'} gap={2}>
+                  {!disableCollapse && (
+                    <Button
+                      icon={ChevronDownIcon}
+                      size={'small'}
+                      type={'text'}
+                      onClick={() => setExpanded(false)}
+                    >
+                      {t('taskDetail.collapseReply')}
+                    </Button>
+                  )}
+                  <AttachmentUploadButton onFiles={handleAttach} />
+                </Flexbox>
+              }
+              right={
+                <SendButton
+                  disabled={!canSubmit && !submitting}
+                  loading={submitting}
+                  shape={'round'}
+                  title={t('taskDetail.replyInThread')}
+                  type={'primary'}
+                  onClick={handleSubmit}
+                />
+              }
+            />
+          }
+        >
           <EditorCanvas
             editor={editor}
             floatingToolbar={false}
-            placeholder={t('taskDetail.commentPlaceholder')}
-            style={{ paddingBottom: 4 }}
+            placeholder={t('taskDetail.replyPlaceholder')}
+            style={{ paddingBlock: 0 }}
             onContentChange={handleContentChange}
             onPressEnter={({ event }) => {
               if (shouldSendOnEnter(event)) {
@@ -106,21 +160,12 @@ const FeedbackInput = memo<FeedbackInputProps>(({ taskId, topicId }) => {
               }
             }}
           />
-        </div>
-        <Flexbox horizontal align={'center'} gap={4} style={{ flexShrink: 0 }}>
-          <AttachmentUploadButton onFiles={handleAttach} />
-          <SendButton
-            disabled={!canSubmit && !submitting}
-            loading={submitting}
-            shape={'round'}
-            title={t('taskDetail.commentSubmitAndRun')}
-            type={'text'}
-            onClick={handleSubmit}
-          />
-        </Flexbox>
+        </ChatInput>
       </Flexbox>
-    </Flexbox>
-  );
-});
+    );
+  },
+);
+
+FeedbackInput.displayName = 'FeedbackInput';
 
 export default FeedbackInput;

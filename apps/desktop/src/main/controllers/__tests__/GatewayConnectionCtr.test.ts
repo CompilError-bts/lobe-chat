@@ -9,6 +9,7 @@ import ImessageBridgeService from '@/services/imessageBridgeSrv';
 import GatewayConnectionCtr from '../GatewayConnectionCtr';
 import HeterogeneousAgentCtr from '../HeterogeneousAgentCtr';
 import LocalFileCtr from '../LocalFileCtr';
+import McpCtr from '../McpCtr';
 import RemoteServerConfigCtr from '../RemoteServerConfigCtr';
 import ShellCommandCtr from '../ShellCommandCtr';
 
@@ -69,6 +70,26 @@ const { ipcMainHandleMock, MockGatewayClient } = vi.hoisted(() => {
       });
     }
 
+    simulateMcpCallRequest(
+      apiName: string,
+      args: object,
+      params: object,
+      requestId = 'mcp-req-1',
+      identifier = 'kimi-datasource',
+    ) {
+      this.emit('tool_call_request', {
+        requestId,
+        toolCall: {
+          apiName,
+          arguments: JSON.stringify(args),
+          identifier,
+          params,
+          type: 'mcp',
+        },
+        type: 'tool_call_request',
+      });
+    }
+
     simulateMessageApiRequest(
       platform: string,
       apiName: string,
@@ -123,7 +144,9 @@ const { ipcMainHandleMock, MockGatewayClient } = vi.hoisted(() => {
 
 vi.mock('electron', () => ({
   app: {
+    getAppPath: vi.fn(() => '/mock/app'),
     getPath: vi.fn((name: string) => `/mock/${name}`),
+    getVersion: vi.fn(() => '1.2.3'),
   },
   ipcMain: { handle: ipcMainHandleMock },
   powerSaveBlocker: {
@@ -170,7 +193,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 vi.mock('node:os', () => ({
-  default: { hostname: vi.fn(() => 'mock-hostname') },
+  default: { hostname: vi.fn(() => 'mock-hostname'), tmpdir: vi.fn(() => '/tmp') },
 }));
 
 vi.mock('@lobechat/device-gateway-client', () => ({
@@ -221,13 +244,17 @@ const mockShellCommandCtr = {
 
 const mockHeterogeneousAgentCtr = {
   sendPrompt: vi.fn().mockResolvedValue(undefined),
-  spawnLhHeteroExec: vi.fn(),
+  spawnLhHeteroExec: vi.fn().mockResolvedValue({ status: 'accepted' }),
   startSession: vi.fn().mockResolvedValue({ sessionId: 'mock-session-id' }),
 } as unknown as HeterogeneousAgentCtr;
 
 const mockImessageBridgeSrv = {
   handleGatewayMessageApi: vi.fn().mockResolvedValue({ ok: true }),
 } as unknown as ImessageBridgeService;
+
+const mockMcpCtr = {
+  runStdioMcpTool: vi.fn().mockResolvedValue({ content: 'mcp result', state: {}, success: true }),
+} as unknown as McpCtr;
 
 const mockRemoteServerConfigCtr = {
   getAccessToken: vi.fn().mockResolvedValue('mock-access-token'),
@@ -247,6 +274,7 @@ const mockApp = {
     if (Cls === LocalFileCtr) return mockLocalFileCtr;
     if (Cls === ShellCommandCtr) return mockShellCommandCtr;
     if (Cls === HeterogeneousAgentCtr) return mockHeterogeneousAgentCtr;
+    if (Cls === McpCtr) return mockMcpCtr;
     return null;
   }),
   getService: vi.fn((Cls) => {
@@ -305,6 +333,7 @@ describe('GatewayConnectionCtr', () => {
       expect(options.deviceId).toBe('stored-device-id');
       expect(options.gatewayUrl).toBe('https://device-gateway.lobehub.com');
       expect(options.logger).toBeDefined();
+      expect(options.userAgent).toBe('LobeHub Desktop/1.2.3');
     });
 
     it('should use custom gateway URL from store when set', async () => {
@@ -606,6 +635,89 @@ describe('GatewayConnectionCtr', () => {
         },
       });
     });
+
+    it('should route tunneled stdio MCP calls to McpCtr.runStdioMcpTool', async () => {
+      const client = await connectAndOpen();
+
+      client.simulateMcpCallRequest(
+        'getStock',
+        { symbol: 'AAPL' },
+        { args: ['stock-mcp'], command: 'npx', env: { TOKEN: 'secret' }, name: 'kimi-datasource' },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The builtin local-system switch is keyed on apiName and would reject
+      // 'getStock'; the `type: 'mcp'` discriminator routes to the MCP client.
+      expect(mockMcpCtr.runStdioMcpTool).toHaveBeenCalledWith({
+        args: '{"symbol":"AAPL"}',
+        env: { TOKEN: 'secret' },
+        params: { args: ['stock-mcp'], command: 'npx', name: 'kimi-datasource' },
+        toolName: 'getStock',
+      });
+    });
+
+    it('should NOT route to MCP when params are present but type is not mcp', async () => {
+      // Regression: routing must follow the explicit `type` discriminator, not
+      // the mere presence of `params`. A builtin call that happens to carry a
+      // `params` field must still go to the builtin switch.
+      const client = await connectAndOpen();
+
+      client.emit('tool_call_request', {
+        requestId: 'tool-with-params',
+        toolCall: {
+          apiName: 'readFile',
+          arguments: JSON.stringify({ path: '/a.txt' }),
+          identifier: 'lobe-local-system',
+          params: { args: [], command: 'npx', name: 'x' },
+          type: 'tool',
+        },
+        type: 'tool_call_request',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(mockMcpCtr.runStdioMcpTool).not.toHaveBeenCalled();
+      expect(mockLocalFileCtr.readFile).toHaveBeenCalled();
+    });
+
+    it('should send tool_call_response envelope for a successful MCP call', async () => {
+      vi.mocked(mockMcpCtr.runStdioMcpTool).mockResolvedValueOnce({
+        content: 'stock: 100',
+        state: { rows: 1 },
+        success: true,
+      });
+      const client = await connectAndOpen();
+
+      client.simulateMcpCallRequest(
+        'getStock',
+        {},
+        { args: [], command: 'npx', name: 'kimi-datasource' },
+        'mcp-ok',
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(client.sendToolCallResponse).toHaveBeenCalledWith({
+        requestId: 'mcp-ok',
+        result: { content: 'stock: 100', state: { rows: 1 }, success: true },
+      });
+    });
+
+    it('should send error response when the MCP call throws', async () => {
+      vi.mocked(mockMcpCtr.runStdioMcpTool).mockRejectedValueOnce(new Error('spawn ENOENT'));
+      const client = await connectAndOpen();
+
+      client.simulateMcpCallRequest(
+        'getStock',
+        {},
+        { args: [], command: 'missing-bin', name: 'kimi-datasource' },
+        'mcp-err',
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(client.sendToolCallResponse).toHaveBeenCalledWith({
+        requestId: 'mcp-err',
+        result: { content: 'spawn ENOENT', error: 'spawn ENOENT', success: false },
+      });
+    });
   });
 
   describe('message API routing', () => {
@@ -722,7 +834,7 @@ describe('GatewayConnectionCtr', () => {
       vi.mocked(mockHeterogeneousAgentCtr.spawnLhHeteroExec).mockClear();
     });
 
-    it.each(['openclaw', 'hermes', 'codex', 'claude-code'] as const)(
+    it.each(['openclaw', 'hermes', 'codex', 'claude-code', 'opencode'] as const)(
       'forwards agentType "%s" to spawnLhHeteroExec',
       async (agentType) => {
         const client = await connectAndOpen();
@@ -751,6 +863,20 @@ describe('GatewayConnectionCtr', () => {
       );
     });
 
+    it('forwards resolved selector args from the request to spawnLhHeteroExec', async () => {
+      const client = await connectAndOpen();
+      client.simulateAgentRunRequest('claude-code', 'op-args', 'hi', 'mock-jwt', {
+        args: ['--model', 'opus', '--effort', 'high'],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(mockHeterogeneousAgentCtr.spawnLhHeteroExec).toHaveBeenCalledWith(
+        expect.objectContaining({
+          args: ['--model', 'opus', '--effort', 'high'],
+        }),
+      );
+    });
+
     it('sends accepted ack and spawns lh hetero exec', async () => {
       const client = await connectAndOpen();
       client.simulateAgentRunRequest('openclaw', 'op-xyz');
@@ -763,12 +889,42 @@ describe('GatewayConnectionCtr', () => {
       expect(mockHeterogeneousAgentCtr.spawnLhHeteroExec).toHaveBeenCalledWith(
         expect.objectContaining({
           agentType: 'openclaw',
-          jwt: 'mock-jwt',
+          // Reuses the device's own session token as the run identity, not the
+          // dispatched operation jwt.
+          jwt: 'mock-access-token',
           operationId: 'op-xyz',
           prompt: 'hello',
           serverUrl: 'https://server.example.com',
           topicId: 'topic-1',
         }),
+      );
+    });
+
+    it('reuses the device access token as the run jwt instead of request.jwt', async () => {
+      const client = await connectAndOpen();
+      client.simulateAgentRunRequest('claude-code', 'op-auth', 'hi', 'dispatched-operation-jwt');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(mockHeterogeneousAgentCtr.spawnLhHeteroExec).toHaveBeenCalledWith(
+        expect.objectContaining({ jwt: 'mock-access-token' }),
+      );
+    });
+
+    it('falls back to request.jwt when the device has no access token', async () => {
+      const client = await connectAndOpen();
+      // Set after connect so the auto-connect getAccessToken call isn't the one
+      // that returns null — only the executeAgentRun lookup should see no token.
+      vi.mocked(mockRemoteServerConfigCtr.getAccessToken).mockResolvedValueOnce(null);
+      client.simulateAgentRunRequest(
+        'claude-code',
+        'op-fallback',
+        'hi',
+        'dispatched-operation-jwt',
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(mockHeterogeneousAgentCtr.spawnLhHeteroExec).toHaveBeenCalledWith(
+        expect.objectContaining({ jwt: 'dispatched-operation-jwt' }),
       );
     });
 
@@ -799,6 +955,23 @@ describe('GatewayConnectionCtr', () => {
       expect(client.sendAgentRunAck).toHaveBeenCalledWith({
         operationId: 'op-fail',
         reason: 'binary not found',
+        status: 'rejected',
+      });
+    });
+
+    it('forwards an asynchronous spawn rejection instead of acknowledging accepted', async () => {
+      vi.mocked(mockHeterogeneousAgentCtr.spawnLhHeteroExec).mockResolvedValueOnce({
+        reason: 'spawn EACCES',
+        status: 'rejected',
+      });
+
+      const client = await connectAndOpen();
+      client.simulateAgentRunRequest('opencode', 'op-spawn-fail');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(client.sendAgentRunAck).toHaveBeenCalledWith({
+        operationId: 'op-spawn-fail',
+        reason: 'spawn EACCES',
         status: 'rejected',
       });
     });

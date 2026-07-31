@@ -27,6 +27,7 @@ import { chunks, embeddings } from './rag';
 import { sessions } from './session';
 import { threads, topics } from './topic';
 import { users } from './user';
+import { workspaces } from './workspace';
 
 /**
  * Message groups table for multi-models parallel conversations
@@ -46,6 +47,7 @@ export const messageGroups = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
 
     // Support nested structure
     // @ts-ignore
@@ -80,6 +82,7 @@ export const messageGroups = pgTable(
     index('message_groups_type_idx').on(t.type),
     index('message_groups_parent_group_id_idx').on(t.parentGroupId),
     index('message_groups_parent_message_id_idx').on(t.parentMessageId),
+    index('message_groups_workspace_id_idx').on(t.workspaceId),
   ],
 );
 
@@ -105,8 +108,8 @@ export const messages = pgTable(
     metadata: jsonb('metadata'),
     /**
      * Token usage + cost for this message, promoted out of `metadata.usage`
-     * into a dedicated column. `metadata.usage` stays the source of truth during
-     * the dual-write transition; new reads/aggregations should target this column.
+     * into a dedicated column. New writes target this column exclusively;
+     * readers may temporarily fall back to `metadata.usage` for legacy rows.
      */
     usage: jsonb('usage').$type<ModelUsage>(),
 
@@ -146,12 +149,14 @@ export const messages = pgTable(
     messageGroupId: varchar255('message_group_id').references(() => messageGroups.id, {
       onDelete: 'cascade',
     }),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
     ...timestamps,
   },
   (table) => [
     index('messages_created_at_idx').on(table.createdAt),
     uniqueIndex('message_client_id_user_unique').on(table.clientId, table.userId),
     index('messages_topic_id_idx').on(table.topicId),
+    index('messages_topic_id_updated_at_idx').on(table.topicId, table.updatedAt),
     index('messages_parent_id_idx').on(table.parentId),
     index('messages_quota_id_idx').on(table.quotaId),
 
@@ -165,6 +170,7 @@ export const messages = pgTable(
     // aggregations and range filters don't scan the full column.
     index('messages_usage_cost_idx').on(sql`(("usage"->>'cost')::numeric)`),
     index('messages_usage_total_tokens_idx').on(sql`(("usage"->>'totalTokens')::numeric)`),
+    index('messages_workspace_id_idx').on(table.workspaceId),
   ],
 );
 
@@ -190,11 +196,13 @@ export const messagePlugins = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
   },
   (t) => [
     uniqueIndex('message_plugins_client_id_user_id_unique').on(t.clientId, t.userId),
     index('message_plugins_user_id_idx').on(t.userId),
     index('message_plugins_tool_call_id_idx').on(t.toolCallId),
+    index('message_plugins_workspace_id_idx').on(t.workspaceId),
   ],
 );
 
@@ -211,10 +219,12 @@ export const messageTTS = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
   },
   (t) => ({
     clientIdUnique: uniqueIndex('message_tts_client_id_user_id_unique').on(t.clientId, t.userId),
     userIdIdx: index('message_tts_user_id_idx').on(t.userId),
+    workspaceIdIdx: index('message_tts_workspace_id_idx').on(t.workspaceId),
   }),
 );
 
@@ -231,6 +241,7 @@ export const messageTranslates = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
   },
   (t) => ({
     clientIdUnique: uniqueIndex('message_translates_client_id_user_id_unique').on(
@@ -238,6 +249,7 @@ export const messageTranslates = pgTable(
       t.userId,
     ),
     userIdIdx: index('message_translates_user_id_idx').on(t.userId),
+    workspaceIdIdx: index('message_translates_workspace_id_idx').on(t.workspaceId),
   }),
 );
 
@@ -255,11 +267,13 @@ export const messagesFiles = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
   },
   (t) => ({
     pk: primaryKey({ columns: [t.fileId, t.messageId] }),
     userIdIdx: index('messages_files_user_id_idx').on(t.userId),
     messageIdIdx: index('messages_files_message_id_idx').on(t.messageId),
+    workspaceIdIdx: index('messages_files_workspace_id_idx').on(t.workspaceId),
   }),
 );
 
@@ -276,6 +290,7 @@ export const messageQueries = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
     embeddingsId: uuid('embeddings_id').references(() => embeddings.id, { onDelete: 'set null' }),
   },
   (t) => ({
@@ -286,6 +301,7 @@ export const messageQueries = pgTable(
     userIdIdx: index('message_queries_user_id_idx').on(t.userId),
     messageIdIdx: index('message_queries_message_id_idx').on(t.messageId),
     embeddingsIdIdx: index('message_queries_embeddings_id_idx').on(t.embeddingsId),
+    workspaceIdIdx: index('message_queries_workspace_id_idx').on(t.workspaceId),
   }),
 );
 
@@ -301,12 +317,14 @@ export const messageQueryChunks = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
   },
   (t) => ({
     pk: primaryKey({ columns: [t.chunkId, t.messageId, t.queryId] }),
     userIdIdx: index('message_query_chunks_user_id_idx').on(t.userId),
     messageIdIdx: index('message_query_chunks_message_id_idx').on(t.messageId),
     queryIdIdx: index('message_query_chunks_query_id_idx').on(t.queryId),
+    workspaceIdIdx: index('message_query_chunks_workspace_id_idx').on(t.workspaceId),
   }),
 );
 export type NewMessageFileChunk = typeof messageQueryChunks.$inferInsert;
@@ -321,10 +339,12 @@ export const messageChunks = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
   },
   (t) => ({
     pk: primaryKey({ columns: [t.chunkId, t.messageId] }),
     userIdIdx: index('message_chunks_user_id_idx').on(t.userId),
     messageIdIdx: index('message_chunks_message_id_idx').on(t.messageId),
+    workspaceIdIdx: index('message_chunks_workspace_id_idx').on(t.workspaceId),
   }),
 );

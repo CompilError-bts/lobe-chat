@@ -10,7 +10,8 @@ import {
   text,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
-import { createInsertSchema } from 'drizzle-zod';
+import { createInsertSchema, createUpdateSchema } from 'drizzle-zod';
+import { z } from 'zod';
 
 import { createNanoId, idGenerator } from '../utils/idGenerator';
 import { amountNumeric, createdAt, timestamps, timestamptz } from './_helpers';
@@ -19,6 +20,7 @@ import { chatGroups } from './chatGroup';
 import { documents } from './file';
 import { sessions } from './session';
 import { users } from './user';
+import { workspaces } from './workspace';
 
 export const topics = pgTable(
   'topics',
@@ -43,7 +45,17 @@ export const topics = pgTable(
     trigger: text('trigger'), // 'cron' | 'chat' | 'api' | 'eval' | 'share' - topic creation trigger source
     mode: text('mode'), // 'temp' | 'test' | 'default' - topic usage scenario
     status: text('status', {
-      enum: ['active', 'running', 'paused', 'waitingForHuman', 'failed', 'completed', 'archived'],
+      enum: [
+        'active',
+        'running',
+        'paused',
+        'waitingForHuman',
+        'scheduled',
+        'failed',
+        'completed',
+        'archived',
+        'unread',
+      ],
     }),
     completedAt: timestamptz('completed_at'),
 
@@ -69,10 +81,12 @@ export const topics = pgTable(
      */
     senderId: text('sender_id'),
 
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
     ...timestamps,
   },
   (t) => [
     uniqueIndex('topics_client_id_user_id_unique').on(t.clientId, t.userId),
+    index('topics_created_at_idx').on(t.createdAt),
     index('topics_user_id_idx').on(t.userId),
     index('topics_id_user_id_idx').on(t.id, t.userId),
     index('topics_session_id_idx').on(t.sessionId),
@@ -84,6 +98,7 @@ export const topics = pgTable(
     index('topics_provider_idx').on(t.provider),
     index('topics_user_id_completed_at_idx').on(t.userId, t.completedAt),
     index('topics_sender_id_idx').on(t.senderId),
+    index('topics_workspace_id_idx').on(t.workspaceId),
     index('topics_extract_status_gin_idx').using(
       'gin',
       sql`(metadata->'userMemoryExtractStatus') jsonb_path_ops`,
@@ -93,6 +108,21 @@ export const topics = pgTable(
 
 export type NewTopic = typeof topics.$inferInsert;
 export type TopicItem = typeof topics.$inferSelect;
+
+/** Single source of truth for thread `type` — column def + zod schemas share this. */
+export const THREAD_TYPE = ['continuation', 'standalone', 'isolation', 'eval'] as const;
+
+/** Single source of truth for thread `status` — column def + zod schemas share this. */
+export const THREAD_STATUS = [
+  'active',
+  'processing',
+  'pending',
+  'inReview',
+  'todo',
+  'cancel',
+  'completed',
+  'failed',
+] as const;
 
 // @ts-ignore
 export const threads = pgTable(
@@ -105,19 +135,8 @@ export const threads = pgTable(
     title: text('title'),
     content: text('content'),
     editor_data: jsonb('editor_data'),
-    type: text('type', { enum: ['continuation', 'standalone', 'isolation', 'eval'] }).notNull(),
-    status: text('status', {
-      enum: [
-        'active',
-        'processing',
-        'pending',
-        'inReview',
-        'todo',
-        'cancel',
-        'completed',
-        'failed',
-      ],
-    }),
+    type: text('type', { enum: THREAD_TYPE }).notNull(),
+    status: text('status', { enum: THREAD_STATUS }),
 
     topicId: text('topic_id')
       .references(() => topics.id, { onDelete: 'cascade' })
@@ -136,6 +155,7 @@ export const threads = pgTable(
       .notNull(),
 
     lastActiveAt: timestamptz('last_active_at').defaultNow(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
     ...timestamps,
   },
   (t) => [
@@ -146,12 +166,32 @@ export const threads = pgTable(
     index('threads_agent_id_idx').on(t.agentId),
     index('threads_group_id_idx').on(t.groupId),
     index('threads_parent_thread_id_idx').on(t.parentThreadId),
+    index('threads_workspace_id_idx').on(t.workspaceId),
   ],
 );
 
 export type NewThread = typeof threads.$inferInsert;
 export type ThreadItem = typeof threads.$inferSelect;
-export const insertThreadSchema = createInsertSchema(threads);
+// Explicit enum/jsonb overrides: plain createInsertSchema(threads) hits TS2589
+// (excessively deep instantiation) under Zod 4 because of self-ref parentThreadId
+// plus multi-value text enums; overrides keep inference shallow and correct.
+// Preserve insert nullability: `type` is notNull (required), `status` is nullable.
+// Enum values come from THREAD_TYPE / THREAD_STATUS so column def and schema can't drift.
+export const insertThreadSchema = createInsertSchema(threads, {
+  metadata: z.custom<ThreadMetadata>().optional(),
+  status: z.enum(THREAD_STATUS).nullish(),
+  type: z.enum(THREAD_TYPE),
+});
+
+// Prefer createUpdateSchema over insertThreadSchema.partial() — .partial() on the
+// insert schema still blows the instantiation depth limit (TS2589) under Zod 4.
+// All refined fields must be optional: bare z.enum refinements are NOT auto-wrapped
+// by createUpdateSchema and would require type/status on every partial update.
+export const updateThreadSchema = createUpdateSchema(threads, {
+  metadata: z.custom<ThreadMetadata>().optional(),
+  status: z.enum(THREAD_STATUS).nullish(),
+  type: z.enum(THREAD_TYPE).optional(),
+});
 
 /**
  * Document-Topic association table - Implements many-to-many relationship between documents and topics
@@ -170,6 +210,7 @@ export const topicDocuments = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
 
     createdAt: createdAt(),
   },
@@ -178,6 +219,7 @@ export const topicDocuments = pgTable(
     index('topic_documents_user_id_idx').on(t.userId),
     index('topic_documents_topic_id_idx').on(t.topicId),
     index('topic_documents_document_id_idx').on(t.documentId),
+    index('topic_documents_workspace_id_idx').on(t.workspaceId),
   ],
 );
 
@@ -201,6 +243,7 @@ export const topicShares = pgTable(
     userId: text('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    workspaceId: text('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
 
     visibility: text('visibility').default('private').notNull(), // 'private' | 'link'
 
@@ -211,6 +254,7 @@ export const topicShares = pgTable(
   (t) => [
     uniqueIndex('topic_shares_topic_id_unique').on(t.topicId),
     index('topic_shares_user_id_idx').on(t.userId),
+    index('topic_shares_workspace_id_idx').on(t.workspaceId),
   ],
 );
 
